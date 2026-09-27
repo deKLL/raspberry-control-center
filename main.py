@@ -10,6 +10,7 @@ import time
 import queue
 import threading
 import subprocess
+import datetime
 from typing import Optional, Dict, Any
 import customtkinter as ctk
 
@@ -20,7 +21,8 @@ from ui_components import (
     CyberMetricCard,
     CyberStatusBadge,
     CyberLogViewer,
-    CyberCodeEditor
+    CyberCodeEditor,
+    CyberToast
 )
 from network_scanner import NetworkScanner
 
@@ -40,9 +42,9 @@ class TyrellControlCenterApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("green")
 
-        self.title("TYRELL // CONTROL CENTER v2.0 - CYBERPUNK ADMIN")
-        self.geometry("1240x820")
-        self.minsize(1050, 720)
+        self.title("TYRELL // CONTROL CENTER v2.0")
+        self.geometry("1280x850")
+        self.minsize(1080, 720)
         self.configure(fg_color=THEME["bg_dark"])
 
         # Load Configuration
@@ -54,16 +56,19 @@ class TyrellControlCenterApp(ctk.CTk):
         self.sound_enabled = self.cfg.get("sound_alerts", True)
         self.previous_service_state = "unknown"
         self.log_stream_stop_event = threading.Event()
-        self.macro_history = []
+        self.shell_history: list = []
+        self.shell_history_idx: int = -1
+        self._poll_count = 0
         
         # Thread-safe UI dispatch queue
         self.ui_queue = queue.Queue()
         self._process_ui_queue()
         
-        # Build UI Elements
+        # Build UI Shell
         self._build_header()
         self._build_banner()
         self._build_tabview()
+        self._build_toast_container()
         self._build_footer()
 
         # Window Close Protocol
@@ -73,21 +78,36 @@ class TyrellControlCenterApp(ctk.CTk):
         self._start_connection_loop()
 
     def dispatch_ui(self, fn):
-        """Thread-safe UI callback dispatcher."""
+        """Thread-safe UI callback dispatcher — enqueue fn for main thread execution."""
         self.ui_queue.put(fn)
 
     def _process_ui_queue(self):
-        """Periodic drain of UI events onto Tk main thread."""
+        """Periodic drain of UI events onto the Tk main thread."""
         try:
-            while not self.ui_queue.empty():
+            for _ in range(50):
                 try:
                     fn = self.ui_queue.get_nowait()
                     fn()
+                except queue.Empty:
+                    break
                 except Exception:
                     pass
         finally:
             if self.is_monitoring:
-                self.after(35, self._process_ui_queue)
+                self.after(30, self._process_ui_queue)
+
+    # =========================================================================
+    # TOAST NOTIFICATIONS
+    # =========================================================================
+    def _build_toast_container(self):
+        """Floating notification area in the bottom-right corner."""
+        self.toast_container = ctk.CTkFrame(self, fg_color="transparent")
+        self.toast_container.place(relx=1.0, rely=1.0, anchor="se", x=-20, y=-40)
+
+    def show_toast(self, message: str, level: str = "info", duration_ms: int = 4000):
+        """Display a toast notification."""
+        toast = CyberToast(self.toast_container, message=message, level=level, duration_ms=duration_ms)
+        toast.pack(anchor="e", pady=2, padx=4)
 
     # =========================================================================
     # HEADER SECTION
@@ -110,7 +130,7 @@ class TyrellControlCenterApp(ctk.CTk):
 
         self.brand_ver = ctk.CTkLabel(
             self.logo_frame,
-            text=" v2.0 [CYBERPUNK EDITION]",
+            text=" v2.0",
             font=FONTS["sub"],
             text_color=THEME["neon_cyan"]
         )
@@ -120,11 +140,11 @@ class TyrellControlCenterApp(ctk.CTk):
         self.header_actions = ctk.CTkFrame(self.header_frame, fg_color="transparent")
         self.header_actions.pack(side="right", padx=16, pady=10)
 
-        # Connection Badge
+        # Connection Badge (now with pulse animation from updated CyberStatusBadge)
         self.conn_badge = CyberStatusBadge(self.header_actions, initial_text="CONNECTING...", initial_color=THEME["neon_gold"])
         self.conn_badge.pack(side="left", padx=6)
 
-        # Telemetry Pill (Ping + Host)
+        # Telemetry Pill (Ping + Host + Uptime)
         self.telemetry_lbl = ctk.CTkLabel(
             self.header_actions,
             text=f"{self.cfg['user']}@{self.cfg['host']} | -- ms",
@@ -137,7 +157,7 @@ class TyrellControlCenterApp(ctk.CTk):
         self.reconnect_btn = ctk.CTkButton(
             self.header_actions,
             text="🔄 RECONNECT",
-            width=90,
+            width=100,
             height=28,
             font=FONTS["button_sm"],
             fg_color="#1F2333",
@@ -153,7 +173,7 @@ class TyrellControlCenterApp(ctk.CTk):
         self.settings_btn = ctk.CTkButton(
             self.header_actions,
             text="⚙ SETTINGS",
-            width=80,
+            width=90,
             height=28,
             font=FONTS["button_sm"],
             fg_color="#1F2333",
@@ -169,7 +189,7 @@ class TyrellControlCenterApp(ctk.CTk):
         self.reboot_btn = ctk.CTkButton(
             self.header_actions,
             text="⚡ REBOOT",
-            width=75,
+            width=80,
             height=28,
             font=FONTS["button_sm"],
             fg_color="#3D3511",
@@ -185,7 +205,7 @@ class TyrellControlCenterApp(ctk.CTk):
         self.shutdown_btn = ctk.CTkButton(
             self.header_actions,
             text="🛑 SHUTDOWN",
-            width=85,
+            width=95,
             height=28,
             font=FONTS["button_sm"],
             fg_color="#3D1418",
@@ -213,7 +233,7 @@ class TyrellControlCenterApp(ctk.CTk):
     def _show_banner(self, show: bool, msg: str = ""):
         if show:
             if msg:
-                self.banner_lbl.configure(text=f"⚠️ SSH LINK ALERT: {msg}")
+                self.banner_lbl.configure(text=f"⚠️ {msg}")
             self.banner_frame.pack(fill="x", after=self.header_frame)
         else:
             self.banner_frame.pack_forget()
@@ -238,9 +258,9 @@ class TyrellControlCenterApp(ctk.CTk):
         # Tab Creation
         self.tab_health = self.tabs.add("  📊 SYSTEM HEALTH  ")
         self.tab_agent = self.tabs.add("  🤖 RESALE AGENT  ")
-        self.tab_ide = self.tabs.add("  💻 QUICK IDE & DEPLOY  ")
-        self.tab_macros = self.tabs.add("  ⚡ QUICK MACROS & SHELL  ")
-        self.tab_radar = self.tabs.add("  📡 LAN RADAR & ANALYTICS  ")
+        self.tab_ide = self.tabs.add("  💻 QUICK IDE  ")
+        self.tab_macros = self.tabs.add("  ⚡ MACROS & SHELL  ")
+        self.tab_radar = self.tabs.add("  📡 RADAR & ANALYTICS  ")
 
         # Populate Tabs
         self._populate_health_tab()
@@ -257,82 +277,86 @@ class TyrellControlCenterApp(ctk.CTk):
         grid.pack(fill="x", pady=6)
         grid.columnconfigure((0, 1, 2, 3), weight=1)
 
-        # 4 Metric Cards
-        self.card_cpu = CyberMetricCard(grid, title="CPU LOAD", icon="⚡", unit="%", max_val=100.0)
+        # 4 Metric Cards with sparkline history
+        self.card_cpu = CyberMetricCard(grid, title="CPU LOAD", icon="⚡", unit="%", max_val=100.0,
+                                        sparkline_color=THEME["neon_green"])
         self.card_cpu.grid(row=0, column=0, padx=6, pady=4, sticky="nsew")
 
-        self.card_ram = CyberMetricCard(grid, title="RAM MEMORY", icon="🧠", unit="%", max_val=100.0)
+        self.card_ram = CyberMetricCard(grid, title="RAM MEMORY", icon="🧠", unit="%", max_val=100.0,
+                                        sparkline_color=THEME["neon_cyan"])
         self.card_ram.grid(row=0, column=1, padx=6, pady=4, sticky="nsew")
 
-        self.card_disk = CyberMetricCard(grid, title="SD STORAGE", icon="💾", unit="%", max_val=100.0)
+        self.card_disk = CyberMetricCard(grid, title="SD STORAGE", icon="💾", unit="%", max_val=100.0,
+                                          sparkline_color=THEME["neon_gold"])
         self.card_disk.grid(row=0, column=2, padx=6, pady=4, sticky="nsew")
 
-        self.card_temp = CyberMetricCard(grid, title="CPU TEMPERATURE", icon="🌡️", unit="°C", max_val=85.0)
+        self.card_temp = CyberMetricCard(grid, title="CPU TEMP", icon="🌡️", unit="°C", max_val=85.0,
+                                          sparkline_color="#FF6B35")
         self.card_temp.grid(row=0, column=3, padx=6, pady=4, sticky="nsew")
 
-        # Bottom section: Maintenance Controls & Process Table
+        # Bottom section: System Info + Maintenance + Process Table
         lower_frame = ctk.CTkFrame(self.tab_health, fg_color="transparent")
-        lower_frame.pack(fill="both", expand=True, pady=(10, 4))
+        lower_frame.pack(fill="both", expand=True, pady=(8, 4))
         lower_frame.columnconfigure(0, weight=1)
-        lower_frame.columnconfigure(1, weight=2)
+        lower_frame.columnconfigure(1, weight=1)
+        lower_frame.columnconfigure(2, weight=2)
+
+        # System Info Card
+        info_card = CyberCard(lower_frame, title="// DEVICE IDENTITY", subtitle="RASPBERRY PI")
+        info_card.grid(row=0, column=0, padx=4, sticky="nsew")
+
+        self.sysinfo_lines = {}
+        info_items = [
+            ("MODEL", "Raspberry Pi Zero 2 W"),
+            ("KERNEL", "--"),
+            ("UPTIME", "--"),
+            ("SSH PING", "--"),
+            ("POLL #", "0"),
+        ]
+        for key, default in info_items:
+            row_frame = ctk.CTkFrame(info_card, fg_color="transparent")
+            row_frame.pack(fill="x", padx=14, pady=2)
+            ctk.CTkLabel(row_frame, text=f"{key}:", font=("Consolas", 9, "bold"),
+                         text_color=THEME["text_secondary"], width=70, anchor="w").pack(side="left")
+            val_lbl = ctk.CTkLabel(row_frame, text=default, font=("Consolas", 9),
+                                   text_color=THEME["text_primary"], anchor="w")
+            val_lbl.pack(side="left", fill="x", expand=True)
+            self.sysinfo_lines[key] = val_lbl
 
         # Maintenance Action Card
-        maint_card = CyberCard(lower_frame, title="// SYSTEM UTILITIES & POWER", subtitle="RASPBERRY PI ZERO 2 W")
-        maint_card.grid(row=0, column=0, padx=6, sticky="nsew")
+        maint_card = CyberCard(lower_frame, title="// SYSTEM UTILITIES", subtitle="POWER & MAINT")
+        maint_card.grid(row=0, column=1, padx=4, sticky="nsew")
 
-        btn_style = {"height": 34, "font": FONTS["button_sm"], "corner_radius": 6}
+        btn_style = {"height": 32, "font": FONTS["button_sm"], "corner_radius": 6}
 
-        ctk.CTkButton(
-            maint_card,
-            text="📦 UPDATE SYSTEM (APT UPGRADE)",
-            fg_color="#1D2A3D",
-            hover_color="#273C5A",
-            border_width=1,
-            border_color=THEME["neon_cyan"],
-            text_color=THEME["neon_cyan"],
-            command=lambda: self._execute_and_stream_macro("System Update", "sudo apt update && sudo apt upgrade -y"),
-            **btn_style
-        ).pack(fill="x", padx=14, pady=6)
-
-        ctk.CTkButton(
-            maint_card,
-            text="🧹 DROP SYSTEM RAM CACHES",
-            fg_color="#1E2822",
-            hover_color="#2A3B30",
-            border_width=1,
-            border_color=THEME["neon_green"],
-            text_color=THEME["neon_green"],
-            command=lambda: self._execute_and_stream_macro("Clear Cache", "sync && echo 3 | sudo tee /proc/sys/vm/drop_caches"),
-            **btn_style
-        ).pack(fill="x", padx=14, pady=6)
-
-        ctk.CTkButton(
-            maint_card,
-            text="🌡️ VCGEN DIAGNOSTICS & VOLTS",
-            fg_color="#2B2418",
-            hover_color="#423722",
-            border_width=1,
-            border_color=THEME["neon_gold"],
-            text_color=THEME["neon_gold"],
-            command=lambda: self._execute_and_stream_macro("VCGen Diagnostic", "vcgencmd measure_temp && vcgencmd get_throttled && vcgencmd measure_volts"),
-            **btn_style
-        ).pack(fill="x", padx=14, pady=6)
-
-        ctk.CTkButton(
-            maint_card,
-            text="🌐 TEST INTERNET CONNECTIVITY",
-            fg_color="#231F2E",
-            hover_color="#362F47",
-            border_width=1,
-            border_color="#A855F7",
-            text_color="#C084FC",
-            command=lambda: self._execute_and_stream_macro("Network Ping", "ping -c 4 8.8.8.8"),
-            **btn_style
-        ).pack(fill="x", padx=14, pady=6)
+        maintenance_actions = [
+            ("📦 SYSTEM UPDATE", THEME["neon_cyan"], "#1D2A3D", "#273C5A",
+             "sudo apt update && sudo apt upgrade -y"),
+            ("🧹 CLEAR RAM CACHE", THEME["neon_green"], "#1E2822", "#2A3B30",
+             "sync && echo 3 | sudo tee /proc/sys/vm/drop_caches"),
+            ("🌡️ VCGEN DIAGNOSTICS", THEME["neon_gold"], "#2B2418", "#423722",
+             "vcgencmd measure_temp && vcgencmd get_throttled && vcgencmd measure_volts"),
+            ("🌐 INTERNET PING", "#C084FC", "#231F2E", "#362F47",
+             "ping -c 4 8.8.8.8"),
+            ("📋 DMESG ERRORS", THEME["neon_red"], "#2A1518", "#3D1D22",
+             "dmesg --level=err,warn | tail -n 20"),
+        ]
+        for title, fg_txt, bg, hov, cmd in maintenance_actions:
+            ctk.CTkButton(
+                maint_card,
+                text=title,
+                fg_color=bg,
+                hover_color=hov,
+                border_width=1,
+                border_color=fg_txt,
+                text_color=fg_txt,
+                command=lambda t=title, c=cmd: self._execute_and_stream_macro(t, c),
+                **btn_style
+            ).pack(fill="x", padx=12, pady=4)
 
         # Active Processes Card
-        procs_card = CyberCard(lower_frame, title="// TOP ACTIVE PROCESSES", subtitle="REAL-TIME PS AUX MONITOR")
-        procs_card.grid(row=0, column=1, padx=6, sticky="nsew")
+        procs_card = CyberCard(lower_frame, title="// TOP PROCESSES", subtitle="BY CPU USAGE")
+        procs_card.grid(row=0, column=2, padx=4, sticky="nsew")
 
         self.proc_textbox = ctk.CTkTextbox(
             procs_card,
@@ -345,7 +369,7 @@ class TyrellControlCenterApp(ctk.CTk):
             border_color=THEME["border_subtle"]
         )
         self.proc_textbox.pack(fill="both", expand=True, padx=12, pady=(0, 10))
-        self.proc_textbox.insert("1.0", "PID     %CPU   %MEM   COMMAND\n------------------------------------------------------------\nWaiting for telemetry data...")
+        self.proc_textbox.insert("1.0", "PID       %CPU   %MEM   COMMAND\n" + "─" * 50 + "\nAwaiting telemetry...")
 
     # =========================================================================
     # TAB 2: RESALE AGENT MANAGER
@@ -358,20 +382,20 @@ class TyrellControlCenterApp(ctk.CTk):
         service_bar = ctk.CTkFrame(top_service_card, fg_color="transparent")
         service_bar.pack(fill="x", padx=12, pady=(0, 10))
 
-        # Service Indicator Badge
-        self.agent_status_badge = CyberStatusBadge(service_bar, initial_text="SERVICE: CHECKING...", initial_color=THEME["neon_gold"])
+        # Service Indicator Badge (pulse-animated)
+        self.agent_status_badge = CyberStatusBadge(service_bar, initial_text="CHECKING SERVICE...", initial_color=THEME["neon_gold"])
         self.agent_status_badge.pack(side="left", padx=4)
 
         self.service_meta_lbl = ctk.CTkLabel(
             service_bar,
-            text="Auto-restart enabled | Service Unit: resale_bot.service",
+            text="Service Unit: resale_bot.service",
             font=FONTS["mono_sm"],
             text_color=THEME["text_secondary"]
         )
         self.service_meta_lbl.pack(side="left", padx=12)
 
         # Action Buttons
-        btn_cfg = {"width": 110, "height": 30, "font": FONTS["button_sm"], "corner_radius": 6}
+        btn_cfg = {"width": 120, "height": 30, "font": FONTS["button_sm"], "corner_radius": 6}
 
         self.btn_agent_start = ctk.CTkButton(
             service_bar,
@@ -434,7 +458,7 @@ class TyrellControlCenterApp(ctk.CTk):
         container.columnconfigure(1, weight=2)
 
         # Left Column: Cyber Macros Bar
-        macros_card = CyberCard(container, title="// QUICK MACROS", subtitle="INSTANT SSH EXECUTION")
+        macros_card = CyberCard(container, title="// QUICK MACROS", subtitle="INSTANT SSH")
         macros_card.grid(row=0, column=0, sticky="nsew", padx=4)
 
         preset_macros = [
@@ -442,10 +466,12 @@ class TyrellControlCenterApp(ctk.CTk):
             ("🌿 GIT STATUS", f"cd {self.cfg['project_dir']} && git status"),
             ("🔄 GIT PULL ORIGIN", f"cd {self.cfg['project_dir']} && git pull"),
             ("🌐 NETWORK INTERFACES", "ip -br addr && ip route"),
-            ("🐍 PYTHON VENV PACKAGES", f"{self.cfg['project_dir']}/venv/bin/pip list | head -n 25"),
-            ("🌲 PYTHON PROCESS TREE", "ps aux --forest | grep -E 'python|resale'"),
-            ("💾 DISK USAGE TREE", "df -hT /"),
-            ("⚡ VOLTS & THROTTLE STATUS", "vcgencmd get_throttled && vcgencmd measure_volts core")
+            ("🐍 VENV PACKAGES", f"{self.cfg['project_dir']}/venv/bin/pip list | head -n 25"),
+            ("🌲 PROCESS TREE", "ps aux --forest | grep -E 'python|resale'"),
+            ("💾 DISK USAGE", "df -hT /"),
+            ("⚡ THROTTLE STATUS", "vcgencmd get_throttled && vcgencmd measure_volts core"),
+            ("🔑 .ENV FILE PREVIEW", f"head -n 20 {self.cfg['project_dir']}/.env"),
+            ("📊 SYSTEMD FULL STATUS", f"systemctl status {self.cfg['service_name']} --no-pager -l"),
         ]
 
         for title, cmd in preset_macros:
@@ -453,7 +479,7 @@ class TyrellControlCenterApp(ctk.CTk):
                 macros_card,
                 text=title,
                 font=FONTS["mono_sm"],
-                height=32,
+                height=30,
                 fg_color=THEME["bg_card_alt"],
                 hover_color="#2E3348",
                 border_width=1,
@@ -462,8 +488,8 @@ class TyrellControlCenterApp(ctk.CTk):
                 command=lambda t=title, c=cmd: self._execute_and_stream_macro(t, c)
             ).pack(fill="x", padx=12, pady=3)
 
-        # Right Column: Interactive Terminal
-        shell_card = CyberCard(container, title="// INTERACTIVE CYBER SHELL", subtitle="BASH EXECUTION ENGINE")
+        # Right Column: Interactive Terminal with history
+        shell_card = CyberCard(container, title="// INTERACTIVE CYBER SHELL", subtitle="BASH REMOTE")
         shell_card.grid(row=0, column=1, sticky="nsew", padx=4)
 
         # Shell Output
@@ -481,15 +507,23 @@ class TyrellControlCenterApp(ctk.CTk):
         self.shell_output.tag_config("tag_prompt", foreground=THEME["neon_cyan"])
         self.shell_output.tag_config("tag_err", foreground=THEME["neon_red"])
         self.shell_output.tag_config("tag_res", foreground=THEME["neon_green"])
-        self.shell_output.insert("1.0", "[TYRELL SHELL READY] Enter any Linux command below.\n")
+        self.shell_output.tag_config("tag_dim", foreground=THEME["text_muted"])
+        self.shell_output.insert("1.0", "╔══════════════════════════════════════════════════════╗\n")
+        self.shell_output.insert("end", "║  TYRELL CYBER SHELL v2.0 — Remote BASH Execution    ║\n")
+        self.shell_output.insert("end", "║  Use ↑↓ arrows for command history                  ║\n")
+        self.shell_output.insert("end", "╚══════════════════════════════════════════════════════╝\n\n")
 
         # Shell Input Bar
         input_bar = ctk.CTkFrame(shell_card, fg_color="transparent")
         input_bar.pack(fill="x", padx=12, pady=(0, 10))
 
+        prompt_lbl = ctk.CTkLabel(input_bar, text="tyrell@pi ~$", font=FONTS["mono"],
+                                   text_color=THEME["neon_cyan"])
+        prompt_lbl.pack(side="left", padx=(0, 6))
+
         self.shell_entry = ctk.CTkEntry(
             input_bar,
-            placeholder_text="Enter remote bash command (e.g. uname -a, ls -la, htop)...",
+            placeholder_text="Enter remote bash command...",
             font=FONTS["mono"],
             height=34,
             fg_color=THEME["bg_input"],
@@ -497,6 +531,8 @@ class TyrellControlCenterApp(ctk.CTk):
         )
         self.shell_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.shell_entry.bind("<Return>", lambda e: self._submit_shell_cmd())
+        self.shell_entry.bind("<Up>", lambda e: self._shell_history_prev())
+        self.shell_entry.bind("<Down>", lambda e: self._shell_history_next())
 
         self.shell_run_btn = ctk.CTkButton(
             input_bar,
@@ -521,18 +557,20 @@ class TyrellControlCenterApp(ctk.CTk):
         container.columnconfigure(0, weight=1)
         container.columnconfigure(1, weight=1)
 
-        # Left Column: Resale Bot SQLite Database Telemetry
-        analytics_card = CyberCard(container, title="// LOT ANALYTICS & DATABASE METRICS", subtitle="BAZOS_MONITOR.DB")
+        # Left Column: Resale Bot Analytics
+        analytics_card = CyberCard(container, title="// LOT ANALYTICS & DATABASE", subtitle="BAZOS_MONITOR.DB")
         analytics_card.grid(row=0, column=0, sticky="nsew", padx=4)
 
-        self.db_items_card = CyberMetricCard(analytics_card, title="INDEXED ITEMS", icon="📦", unit="lots", max_val=5000.0)
+        self.db_items_card = CyberMetricCard(analytics_card, title="INDEXED ITEMS", icon="📦",
+                                              unit="lots", max_val=5000.0, sparkline_color=THEME["neon_cyan"])
         self.db_items_card.pack(fill="x", padx=12, pady=6)
 
-        self.db_subs_card = CyberMetricCard(analytics_card, title="ACTIVE SUBSCRIPTIONS", icon="🎯", unit="filters", max_val=50.0)
+        self.db_subs_card = CyberMetricCard(analytics_card, title="SUBSCRIPTIONS", icon="🎯",
+                                             unit="filters", max_val=50.0, sparkline_color=THEME["neon_purple"])
         self.db_subs_card.pack(fill="x", padx=12, pady=6)
 
         # Last item detected panel
-        last_item_box = CyberCard(analytics_card, title="// LATEST DETECTED LOT", subtitle="REAL-TIME SCRAPER FEED")
+        last_item_box = CyberCard(analytics_card, title="// LATEST DETECTED LOT", subtitle="SCRAPER FEED")
         last_item_box.pack(fill="both", expand=True, padx=12, pady=(6, 10))
 
         self.last_item_lbl = ctk.CTkLabel(
@@ -546,7 +584,7 @@ class TyrellControlCenterApp(ctk.CTk):
         self.last_item_lbl.pack(fill="both", expand=True, padx=12, pady=8)
 
         # Right Column: LAN Network Radar
-        radar_card = CyberCard(container, title="// LAN NETWORK RADAR", subtitle="LOCAL SUBNET SCANNER")
+        radar_card = CyberCard(container, title="// LAN NETWORK RADAR", subtitle="SUBNET SCANNER")
         radar_card.grid(row=0, column=1, sticky="nsew", padx=4)
 
         radar_actions = ctk.CTkFrame(radar_card, fg_color="transparent")
@@ -554,7 +592,7 @@ class TyrellControlCenterApp(ctk.CTk):
 
         self.radar_status_lbl = ctk.CTkLabel(
             radar_actions,
-            text="RADAR READY. Click Scan to discover local nodes.",
+            text="RADAR READY — Click Scan to discover local nodes.",
             font=FONTS["mono_sm"],
             text_color=THEME["text_secondary"]
         )
@@ -589,7 +627,7 @@ class TyrellControlCenterApp(ctk.CTk):
         self.radar_output.tag_config("tag_pi", foreground=THEME["neon_green"])
         self.radar_output.tag_config("tag_node", foreground=THEME["neon_cyan"])
         self.radar_output.tag_config("tag_head", foreground=THEME["neon_gold"])
-        self.radar_output.insert("1.0", "IP ADDRESS       MAC ADDRESS         STATUS     OPEN PORTS   HOST\n----------------------------------------------------------------------\n")
+        self.radar_output.insert("1.0", "IP ADDRESS       MAC ADDRESS         STATUS     OPEN PORTS   HOST\n" + "─" * 70 + "\n")
 
     # =========================================================================
     # FOOTER SECTION
@@ -600,7 +638,7 @@ class TyrellControlCenterApp(ctk.CTk):
 
         self.footer_status = ctk.CTkLabel(
             self.footer,
-            text="SYSTEM INITIALIZED • ASYNC THREADS RUNNING",
+            text="SYSTEM INITIALIZED — ASYNC THREADS RUNNING",
             font=FONTS["mono_sm"],
             text_color=THEME["text_secondary"]
         )
@@ -609,7 +647,7 @@ class TyrellControlCenterApp(ctk.CTk):
         # Sound Alert Toggle
         self.sound_cb = ctk.CTkCheckBox(
             self.footer,
-            text="AUDIO SENTINEL ALERTS",
+            text="AUDIO ALERTS",
             font=FONTS["mono_sm"],
             text_color=THEME["text_secondary"],
             fg_color=THEME["neon_green"],
@@ -640,7 +678,6 @@ class TyrellControlCenterApp(ctk.CTk):
             first_connect = True
             while self.is_monitoring:
                 if not self.ssh.check_connection_health():
-                    # Update UI to reconnecting state
                     self.dispatch_ui(lambda: self._update_connection_ui(False, "RECONNECTING..."))
                     ok, msg = self.ssh.connect(
                         host=self.cfg["host"],
@@ -652,11 +689,11 @@ class TyrellControlCenterApp(ctk.CTk):
                     )
                     if ok:
                         self.dispatch_ui(lambda: self._update_connection_ui(True, "ONLINE"))
+                        self.dispatch_ui(lambda: self.show_toast(
+                            f"SSH connected to {self.cfg['host']}", "success"))
                         if first_connect:
                             first_connect = False
-                            # Start streaming journalctl logs
                             self._start_journal_stream()
-                            # Auto-load the default preset in IDE
                             self.dispatch_ui(lambda: self._handle_ide_load(PRESET_FILES[0]))
                     else:
                         self.dispatch_ui(lambda m=msg: self._update_connection_ui(False, f"OFFLINE ({m[:30]})"))
@@ -664,6 +701,7 @@ class TyrellControlCenterApp(ctk.CTk):
                         continue
 
                 # Fetch Telemetry
+                self._poll_count += 1
                 metrics = self.ssh.get_system_metrics(
                     project_dir=self.cfg["project_dir"],
                     service_name=self.cfg["service_name"]
@@ -678,7 +716,7 @@ class TyrellControlCenterApp(ctk.CTk):
         if connected:
             self.conn_badge.set_status("ONLINE", THEME["neon_green"])
             self.telemetry_lbl.configure(
-                text=f"{self.cfg['user']}@{self.cfg['host']} | {self.ssh.latency_ms:.1f} ms"
+                text=f"{self.cfg['user']}@{self.cfg['host']} | {self.ssh.latency_ms:.0f} ms"
             )
             self._show_banner(False)
         else:
@@ -701,7 +739,7 @@ class TyrellControlCenterApp(ctk.CTk):
         ram_total = m.get("ram_total_mb", 0.0)
         self.card_ram.update_val(
             ram_pct,
-            detail=f"Used: {ram_used:.0f} MB / Total: {ram_total:.0f} MB",
+            detail=f"{ram_used:.0f} MB / {ram_total:.0f} MB",
             custom_text=f"{ram_pct:.1f} %"
         )
 
@@ -711,16 +749,16 @@ class TyrellControlCenterApp(ctk.CTk):
         disk_total = m.get("disk_total_gb", 0.0)
         self.card_disk.update_val(
             disk_pct,
-            detail=f"{disk_used:.1f} GB / {disk_total:.1f} GB (/dev/mmcblk0p2)",
+            detail=f"{disk_used:.1f} GB / {disk_total:.1f} GB",
             custom_text=f"{disk_pct:.1f} %"
         )
 
         # Temp Card
         temp_c = m.get("temp_c", 0.0)
-        status_note = "NORMAL" if temp_c < 60 else ("WARM" if temp_c < 72 else "CRITICAL THERMAL")
+        status_note = "NORMAL" if temp_c < 60 else ("WARM" if temp_c < 72 else "CRITICAL!")
         self.card_temp.update_val(
             temp_c,
-            detail=f"Status: {status_note} | vcgencmd",
+            detail=f"Thermal: {status_note}",
             custom_text=f"{temp_c:.1f} °C"
         )
 
@@ -741,27 +779,34 @@ class TyrellControlCenterApp(ctk.CTk):
         # Top processes
         procs = m.get("top_procs", [])
         if procs:
-            lines = ["PID       %CPU   %MEM   COMMAND", "-" * 56]
+            lines = ["PID       %CPU   %MEM   COMMAND", "─" * 50]
             for p in procs:
                 lines.append(f"{p['pid']:<9} {p['cpu']:<6} {p['mem']:<6} {p['comm']}")
             self.proc_textbox.delete("1.0", "end")
             self.proc_textbox.insert("1.0", "\n".join(lines))
 
+        # System info panel
+        uptime_str = m.get("uptime_str", "--")
+        latency = m.get("latency_ms", 0)
+        self.sysinfo_lines["UPTIME"].configure(text=uptime_str)
+        self.sysinfo_lines["SSH PING"].configure(text=f"{latency:.0f} ms")
+        self.sysinfo_lines["POLL #"].configure(text=str(self._poll_count))
+
         # SQLite Database stats
         db = m.get("db_stats", {})
         item_cnt = db.get("items", 0)
         sub_cnt = db.get("subscriptions", 0)
-        self.db_items_card.update_val(min(item_cnt, 5000), detail=f"Total Database Rows: {item_cnt}", custom_text=f"{item_cnt}")
-        self.db_subs_card.update_val(min(sub_cnt, 50), detail=f"Monitored Search Filters: {sub_cnt}", custom_text=f"{sub_cnt}")
+        self.db_items_card.update_val(min(item_cnt, 5000), detail=f"Total Rows: {item_cnt}", custom_text=f"{item_cnt}")
+        self.db_subs_card.update_val(min(sub_cnt, 50), detail=f"Search Filters: {sub_cnt}", custom_text=f"{sub_cnt}")
 
         last_item = db.get("last_item")
         if last_item:
-            info = f"TITLE: {last_item['title']}\nPRICE: {last_item['price']}\nTIMESTAMP: {last_item['time']}"
+            info = f"📦 {last_item['title']}\n💰 {last_item['price']}\n🕐 {last_item['time']}"
             self.last_item_lbl.configure(text=info, text_color=THEME["neon_green"])
 
-        # Header ping
+        # Header telemetry update
         self.telemetry_lbl.configure(
-            text=f"{self.cfg['user']}@{self.cfg['host']} | {m.get('latency_ms', 0):.1f} ms | Uptime: {m.get('uptime_str', '--')}"
+            text=f"{self.cfg['user']}@{self.cfg['host']} | {latency:.0f} ms | Up: {uptime_str}"
         )
 
     # =========================================================================
@@ -770,22 +815,19 @@ class TyrellControlCenterApp(ctk.CTk):
     def _start_journal_stream(self):
         """Launch background worker for continuous log streaming."""
         self.log_stream_stop_event.set()
-        time.sleep(0.1)
-        self.log_stream_stop_event.clear()
-
-        def stream_worker():
+        # Small non-blocking delay via thread
+        def restart():
+            time.sleep(0.15)
+            self.log_stream_stop_event.clear()
             def on_line(line: str):
                 self.dispatch_ui(lambda l=line: self.log_viewer.append_log_line(l))
-
             self.ssh.stream_journal_logs(
                 service_name=self.cfg["service_name"],
                 on_line_cb=on_line,
                 stop_event=self.log_stream_stop_event,
                 lines=80
             )
-
-        thread = threading.Thread(target=stream_worker, daemon=True)
-        thread.start()
+        threading.Thread(target=restart, daemon=True).start()
 
     # =========================================================================
     # RESALE SERVICE MANAGEMENT
@@ -798,8 +840,9 @@ class TyrellControlCenterApp(ctk.CTk):
             def ui_callback():
                 color = THEME["neon_green"] if ok else THEME["neon_red"]
                 self.footer_status.configure(text=f"SERVICE {action.upper()}: {msg}", text_color=color)
-                # Restart stream if restarted
-                if action in ("start", "restart"):
+                level = "success" if ok else "error"
+                self.show_toast(f"Service {action}: {msg[:40]}", level)
+                if action in ("start", "restart") and ok:
                     self._start_journal_stream()
             self.dispatch_ui(ui_callback)
 
@@ -808,12 +851,16 @@ class TyrellControlCenterApp(ctk.CTk):
     def _trigger_service_failure_alert(self, state: str):
         """Audio and visual alarm when the bot service crashes or stops."""
         if self.sound_enabled and HAS_WINSOUND:
-            try:
-                winsound.Beep(1200, 300)
-                winsound.Beep(800, 300)
-            except Exception:
-                pass
-        self._show_banner(True, f"BOT SERVICE CRITICAL: State changed to {state.upper()}!")
+            def beep():
+                try:
+                    winsound.Beep(1200, 300)
+                    winsound.Beep(800, 300)
+                    winsound.Beep(600, 400)
+                except Exception:
+                    pass
+            threading.Thread(target=beep, daemon=True).start()
+        self.show_toast(f"SERVICE CRITICAL: State → {state.upper()}!", "error", 8000)
+        self._show_banner(True, f"BOT SERVICE DOWN: {state.upper()}")
 
     # =========================================================================
     # QUICK IDE / DEPLOYER ACTIONS
@@ -826,48 +873,53 @@ class TyrellControlCenterApp(ctk.CTk):
             def ui_cb():
                 if ok:
                     self.code_editor.set_content(rel_path, content)
-                    self.footer_status.configure(text=f"LOADED {rel_path} READY TO EDIT", text_color=THEME["neon_green"])
+                    self.footer_status.configure(text=f"LOADED {rel_path}", text_color=THEME["neon_green"])
                 else:
-                    self.code_editor.set_deploy_status(False, f"READ FAILED: {content[:30]}")
-                    self.footer_status.configure(text=f"SFTP ERROR: {content}", text_color=THEME["neon_red"])
+                    self.code_editor.set_deploy_status(False, f"READ FAILED: {content[:40]}")
+                    self.footer_status.configure(text=f"SFTP ERROR: {content[:60]}", text_color=THEME["neon_red"])
+                    self.show_toast(f"SFTP load failed: {rel_path}", "error")
             self.dispatch_ui(ui_cb)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _handle_ide_save(self, rel_path: str, content: str):
-        self.footer_status.configure(text=f"SAVING & DEPLOYING {rel_path} TO PI...", text_color=THEME["neon_gold"])
+        self.footer_status.configure(text=f"DEPLOYING {rel_path} TO PI...", text_color=THEME["neon_gold"])
 
         def worker():
-            # 1. SFTP Write with backup
             ok, msg = self.ssh.write_file(rel_path, content, self.cfg["project_dir"], make_backup=True)
             if not ok:
                 self.dispatch_ui(lambda: self.code_editor.set_deploy_status(False, msg))
+                self.dispatch_ui(lambda: self.show_toast(f"Deploy failed: {msg[:40]}", "error"))
                 return
 
-            # 2. Restart Bot Service
             s_ok, s_msg = self.ssh.manage_service("restart", self.cfg["service_name"])
             
             def ui_cb():
                 if s_ok:
-                    self.code_editor.set_deploy_status(True, f"DEPLOYED & SERVICE RESTARTED")
-                    self.footer_status.configure(text=f"SUCCESS: {rel_path} deployed + resale_bot restarted", text_color=THEME["neon_green"])
+                    self.code_editor.set_deploy_status(True, "DEPLOYED & SERVICE RESTARTED")
+                    self.footer_status.configure(
+                        text=f"SUCCESS: {rel_path} deployed → resale_bot restarted",
+                        text_color=THEME["neon_green"])
+                    self.show_toast(f"Deployed {rel_path} + service restarted", "success")
                     self._start_journal_stream()
                 else:
-                    self.code_editor.set_deploy_status(False, f"SAVED, BUT RESTART FAILED: {s_msg[:30]}")
+                    self.code_editor.set_deploy_status(False, f"SAVED, RESTART FAILED: {s_msg[:30]}")
                     self.footer_status.configure(text=f"RESTART ERROR: {s_msg}", text_color=THEME["neon_red"])
+                    self.show_toast(f"Restart failed: {s_msg[:40]}", "error")
             self.dispatch_ui(ui_cb)
 
         threading.Thread(target=worker, daemon=True).start()
 
     # =========================================================================
-    # SHELL & QUICK MACROS
+    # SHELL & QUICK MACROS (with ↑↓ command history)
     # =========================================================================
     def _submit_shell_cmd(self):
         cmd = self.shell_entry.get().strip()
         if not cmd:
             return
         self.shell_entry.delete(0, "end")
-        self.macro_history.append(cmd)
+        self.shell_history.append(cmd)
+        self.shell_history_idx = len(self.shell_history)
         
         self.shell_output.insert("end", f"\ntyrell@pi:~$ {cmd}\n", "tag_prompt")
         self.shell_output.see("end")
@@ -879,15 +931,39 @@ class TyrellControlCenterApp(ctk.CTk):
                     self.shell_output.insert("end", out)
                 if err:
                     self.shell_output.insert("end", f"[STDERR]\n{err}", "tag_err")
-                self.shell_output.insert("end", f"[EXIT CODE: {code}]\n", "tag_res" if code == 0 else "tag_err")
+                tag = "tag_res" if code == 0 else "tag_err"
+                self.shell_output.insert("end", f"[exit: {code}]\n", tag)
                 self.shell_output.see("end")
             self.dispatch_ui(ui_cb)
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _shell_history_prev(self):
+        """Navigate to previous command in history."""
+        if not self.shell_history:
+            return
+        if self.shell_history_idx > 0:
+            self.shell_history_idx -= 1
+        self.shell_entry.delete(0, "end")
+        self.shell_entry.insert(0, self.shell_history[self.shell_history_idx])
+
+    def _shell_history_next(self):
+        """Navigate to next command in history."""
+        if not self.shell_history:
+            return
+        if self.shell_history_idx < len(self.shell_history) - 1:
+            self.shell_history_idx += 1
+            self.shell_entry.delete(0, "end")
+            self.shell_entry.insert(0, self.shell_history[self.shell_history_idx])
+        else:
+            self.shell_history_idx = len(self.shell_history)
+            self.shell_entry.delete(0, "end")
+
     def _execute_and_stream_macro(self, title: str, cmd: str):
-        self.tabs.set("  ⚡ QUICK MACROS & SHELL  ")
-        self.shell_output.insert("end", f"\n[MACRO: {title.upper()}] $ {cmd}\n", "tag_prompt")
+        self.tabs.set("  ⚡ MACROS & SHELL  ")
+        self.shell_output.insert("end", f"\n{'─' * 50}\n", "tag_dim")
+        self.shell_output.insert("end", f"[MACRO: {title.upper()}]\n", "tag_prompt")
+        self.shell_output.insert("end", f"$ {cmd}\n", "tag_dim")
         self.shell_output.see("end")
 
         def worker():
@@ -897,7 +973,8 @@ class TyrellControlCenterApp(ctk.CTk):
                     self.shell_output.insert("end", out)
                 if err:
                     self.shell_output.insert("end", err, "tag_err")
-                self.shell_output.insert("end", f"[COMPLETED WITH CODE {code}]\n", "tag_res" if code == 0 else "tag_err")
+                tag = "tag_res" if code == 0 else "tag_err"
+                self.shell_output.insert("end", f"[exit: {code}]\n", tag)
                 self.shell_output.see("end")
             self.dispatch_ui(ui_cb)
 
@@ -909,7 +986,8 @@ class TyrellControlCenterApp(ctk.CTk):
     def _start_network_scan(self):
         self.radar_status_lbl.configure(text="SCANNING SUBNET VIA ARP & PORT PROBING...", text_color=THEME["neon_cyan"])
         self.radar_output.delete("1.0", "end")
-        self.radar_output.insert("1.0", "IP ADDRESS       MAC ADDRESS         STATUS     OPEN PORTS   HOST\n----------------------------------------------------------------------\n", "tag_head")
+        self.radar_output.insert("1.0", "IP ADDRESS       MAC ADDRESS         STATUS     OPEN PORTS   HOST\n" + "─" * 70 + "\n", "tag_head")
+        self.show_toast("LAN scan started...", "info", 2000)
 
         def on_device(dev: dict):
             def ui_cb():
@@ -918,19 +996,20 @@ class TyrellControlCenterApp(ctk.CTk):
                 status = dev.get("status", "")
                 ports = dev.get("open_ports", "")
                 host = dev.get("hostname", "")
-                line = f"{ip:<16} {mac:<19} {status:<10} {ports:<12} {host}\n"
                 
-                # Highlight Raspberry Pi
                 tag = "tag_pi" if ip == self.cfg["host"] else "tag_node"
                 if ip == self.cfg["host"]:
-                    line = f"{ip:<16} {mac:<19} [PI ZERO]   {ports:<12} RASPBERRY PI\n"
+                    line = f"{ip:<16} {mac:<19} {'[PI ZERO]':<10} {ports:<12} RASPBERRY PI\n"
+                else:
+                    line = f"{ip:<16} {mac:<19} {status:<10} {ports:<12} {host}\n"
                 self.radar_output.insert("end", line, tag)
                 self.radar_output.see("end")
             self.dispatch_ui(ui_cb)
 
         def on_finish(total: int):
             def ui_cb():
-                self.radar_status_lbl.configure(text=f"SCAN FINISHED. Discovered {total} active nodes.", text_color=THEME["neon_green"])
+                self.radar_status_lbl.configure(text=f"SCAN COMPLETE — {total} active nodes found.", text_color=THEME["neon_green"])
+                self.show_toast(f"LAN scan: {total} devices discovered", "success")
             self.dispatch_ui(ui_cb)
 
         NetworkScanner.scan_network_async(on_device, on_finish)
@@ -941,22 +1020,30 @@ class TyrellControlCenterApp(ctk.CTk):
     def _confirm_system_action(self, action_name: str, cmd: str):
         modal = ctk.CTkToplevel(self)
         modal.title(f"CONFIRM {action_name}")
-        modal.geometry("400x190")
+        modal.geometry("420x200")
         modal.resizable(False, False)
         modal.configure(fg_color=THEME["bg_card"])
         modal.transient(self)
         modal.grab_set()
 
-        ctk.CTkLabel(
-            modal,
-            text=f"⚠️ CRITICAL SYSTEM ACTION: {action_name}",
-            font=FONTS["header"],
-            text_color=THEME["neon_red"] if action_name == "SHUTDOWN" else THEME["neon_gold"]
-        ).pack(pady=(20, 10))
+        # Try to center modal on parent
+        self.update_idletasks()
+        px = self.winfo_x() + (self.winfo_width() - 420) // 2
+        py = self.winfo_y() + (self.winfo_height() - 200) // 2
+        modal.geometry(f"+{px}+{py}")
+
+        accent = THEME["neon_red"] if action_name == "SHUTDOWN" else THEME["neon_gold"]
 
         ctk.CTkLabel(
             modal,
-            text=f"Are you sure you want to execute '{cmd}'\non Raspberry Pi Zero 2 W ({self.cfg['host']})?",
+            text=f"⚠️ CRITICAL: {action_name}",
+            font=FONTS["header"],
+            text_color=accent
+        ).pack(pady=(20, 8))
+
+        ctk.CTkLabel(
+            modal,
+            text=f"Execute '{cmd}' on {self.cfg['host']}?",
             font=FONTS["mono_sm"],
             text_color=THEME["text_primary"],
             justify="center"
@@ -968,7 +1055,7 @@ class TyrellControlCenterApp(ctk.CTk):
         ctk.CTkButton(
             btn_frame,
             text="CANCEL",
-            width=140,
+            width=150,
             fg_color="#2A2A38",
             hover_color="#3A3A4E",
             command=modal.destroy
@@ -976,13 +1063,14 @@ class TyrellControlCenterApp(ctk.CTk):
 
         def proceed():
             modal.destroy()
-            self.footer_status.configure(text=f"EXECUTING {action_name}...", text_color=THEME["neon_red"])
-            self.ssh.exec_command(cmd, timeout=5.0)
+            self.footer_status.configure(text=f"EXECUTING {action_name}...", text_color=accent)
+            self.show_toast(f"{action_name} command sent to Pi", "warn", 5000)
+            threading.Thread(target=lambda: self.ssh.exec_command(cmd, timeout=5.0), daemon=True).start()
 
         ctk.CTkButton(
             btn_frame,
             text=f"YES, {action_name}",
-            width=140,
+            width=150,
             fg_color="#8B1A24" if action_name == "SHUTDOWN" else "#736412",
             hover_color="#A8202D" if action_name == "SHUTDOWN" else "#8C7B16",
             command=proceed
@@ -994,13 +1082,20 @@ class TyrellControlCenterApp(ctk.CTk):
     def _open_settings_dialog(self):
         modal = ctk.CTkToplevel(self)
         modal.title("TYRELL CONFIGURATION")
-        modal.geometry("440x480")
+        modal.geometry("460x500")
         modal.resizable(False, False)
         modal.configure(fg_color=THEME["bg_card"])
         modal.transient(self)
         modal.grab_set()
 
-        ctk.CTkLabel(modal, text="// SSH & SYSTEM CONFIGURATION", font=FONTS["header"], text_color=THEME["neon_green"]).pack(pady=(16, 12))
+        # Center
+        self.update_idletasks()
+        px = self.winfo_x() + (self.winfo_width() - 460) // 2
+        py = self.winfo_y() + (self.winfo_height() - 500) // 2
+        modal.geometry(f"+{px}+{py}")
+
+        ctk.CTkLabel(modal, text="// SSH & SYSTEM CONFIGURATION", font=FONTS["header"],
+                      text_color=THEME["neon_green"]).pack(pady=(16, 12))
 
         entries = {}
         fields = [
@@ -1009,14 +1104,17 @@ class TyrellControlCenterApp(ctk.CTk):
             ("Username", "user", self.cfg["user"]),
             ("Private Key Path", "key_path", self.cfg.get("key_path", "")),
             ("Project Directory", "project_dir", self.cfg["project_dir"]),
-            ("Service Unit Name", "service_name", self.cfg["service_name"])
+            ("Service Unit Name", "service_name", self.cfg["service_name"]),
+            ("Poll Interval (sec)", "poll_interval_sec", str(self.cfg.get("poll_interval_sec", 3.0))),
         ]
 
         for label_text, key, initial in fields:
             box = ctk.CTkFrame(modal, fg_color="transparent")
             box.pack(fill="x", padx=24, pady=4)
-            ctk.CTkLabel(box, text=label_text, font=FONTS["mono_sm"], text_color=THEME["text_secondary"], width=130, anchor="w").pack(side="left")
-            ent = ctk.CTkEntry(box, font=FONTS["mono_sm"], height=28, fg_color=THEME["bg_input"], border_color=THEME["border_subtle"])
+            ctk.CTkLabel(box, text=label_text, font=FONTS["mono_sm"],
+                         text_color=THEME["text_secondary"], width=140, anchor="w").pack(side="left")
+            ent = ctk.CTkEntry(box, font=FONTS["mono_sm"], height=28,
+                               fg_color=THEME["bg_input"], border_color=THEME["border_subtle"])
             ent.insert(0, initial)
             ent.pack(side="right", fill="x", expand=True)
             entries[key] = ent
@@ -1028,15 +1126,21 @@ class TyrellControlCenterApp(ctk.CTk):
             self.cfg["key_path"] = entries["key_path"].get().strip()
             self.cfg["project_dir"] = entries["project_dir"].get().strip()
             self.cfg["service_name"] = entries["service_name"].get().strip()
+            try:
+                self.cfg["poll_interval_sec"] = float(entries["poll_interval_sec"].get().strip() or 3.0)
+            except ValueError:
+                self.cfg["poll_interval_sec"] = 3.0
             save_config(self.cfg)
             modal.destroy()
+            self.show_toast("Settings saved — reconnecting...", "success")
             self._trigger_reconnect()
 
         btn_box = ctk.CTkFrame(modal, fg_color="transparent")
         btn_box.pack(fill="x", padx=24, pady=20)
 
-        ctk.CTkButton(btn_box, text="CANCEL", width=160, fg_color="#2A2A38", command=modal.destroy).pack(side="left", padx=6)
-        ctk.CTkButton(btn_box, text="SAVE & RECONNECT", width=180, fg_color="#006629", hover_color="#008837", command=save_and_close).pack(side="right", padx=6)
+        ctk.CTkButton(btn_box, text="CANCEL", width=170, fg_color="#2A2A38", command=modal.destroy).pack(side="left", padx=6)
+        ctk.CTkButton(btn_box, text="SAVE & RECONNECT", width=200, fg_color="#006629",
+                       hover_color="#008837", command=save_and_close).pack(side="right", padx=6)
 
     def _trigger_reconnect(self):
         self.conn_badge.set_status("RECONNECTING...", THEME["neon_gold"])
